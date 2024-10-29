@@ -1,94 +1,96 @@
 import streamlit as st
-import re
-from vocabulary import Vocabulary, iVocabulary
-
-# Initialize the Streamlit app
-st.title("Next Word Prediction Application")
-
-# User input
-input_text = st.text_input("Enter the input text:", "Once upon a time")
-context_length = st.selectbox("Context length", [5,10,15])
-# context_length = st.select_slider("Context length", [5,10,15], 5)
-embedding_dim = st.selectbox("Embedding dimension", [64,128])
-activation_function = st.selectbox("Activation function", ["relu", "tanh"])
-max_len = st.number_input("Maximum lenght of predicted text", min_value=0, max_value=1000, value=30)
-# num_words_to_predict = st.slider("Number of words to predict", 1, 50, 10)
-input_text = re.sub(r'[^a-zA-Z0-9 \.]', '', input_text)
-input_text = str.lower(input_text)
-
-
-
 import torch
-import torch.nn as nn
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import json
+import numpy as np
+from torch import nn
+import nltk
 
-if activation_function == 'relu':
-    class NextWord(nn.Module):
-        def __init__(self,block_size,vocab_size,emb_dim,hidden_size):
-            super().__init__()
-            self.emb = nn.Embedding(vocab_size,emb_dim)
-            self.lin1 = nn.Linear(block_size*emb_dim,hidden_size)
-            self.lin2 = nn.Linear(hidden_size,vocab_size)
-            self.relu = nn.ReLU()
+# Download nltk tokenizer
+nltk.download('punkt')
 
-        def forward(self, x):
-            x = self.emb(x)
-            x = x.view(x.shape[0],-1)
-            x = self.relu(self.lin1(x))
-            x = self.lin2(x)
-            return x
+# Define the RNNTextGenerator class
+class RNNTextGenerator(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim):
+        super(RNNTextGenerator, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.rnn = nn.LSTM(embedding_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, vocab_size)
 
-    pred_model = NextWord(context_length, len(Vocabulary), embedding_dim, 1024).to(device)
-    pred_model.load_state_dict(torch.load(f"models/model_{embedding_dim}_{context_length}_relu.pth", map_location=device))
+    def forward(self, x):
+        x = self.embedding(x)
+        x, _ = self.rnn(x)
+        x = self.fc(x[:, -1, :])
+        return x
 
-if activation_function == 'tanh':
-    class NextWord(nn.Module):
-        def __init__(self,block_size,vocab_size,emb_dim,hidden_size):
-            super().__init__()
-            self.emb = nn.Embedding(vocab_size,emb_dim)
-            self.lin1 = nn.Linear(block_size*emb_dim,hidden_size)
-            self.lin2 = nn.Linear(hidden_size,vocab_size)
-            self.tanh = nn.Tanh()
+# Helper function to load model and vocab
+def load_model_and_vocab(model_path, vocab_path):
+    with open(vocab_path, 'r') as f:
+        vocab_data = json.load(f)
+    model = RNNTextGenerator(len(vocab_data["word_to_idx"]), st.session_state.embedding_dim, st.session_state.hidden_dim)
+    model.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
+    model.eval()
+    return model, vocab_data["word_to_idx"], vocab_data["idx_to_word"]
 
-        def forward(self, x):
-            x = self.emb(x)
-            x = x.view(x.shape[0],-1)
-            x = self.tanh(self.lin1(x))
-            x = self.lin2(x)
-            return x
-    pred_model = NextWord(context_length, len(Vocabulary), embedding_dim, 1024).to(device)
-    pred_model.load_state_dict(torch.load(f"models/model_{embedding_dim}_{context_length}_tanh.pth", map_location=device))
+# Function to preprocess user input text
+def preprocess_text(text, word_to_idx):
+    tokens = nltk.tokenize.word_tokenize(text.lower())
+    words = [word for word in tokens if word.isalpha()]
+    indices = [word_to_idx.get(word, word_to_idx['unknown token']) for word in words]
+    return indices
 
-def generate_para(model, Vocabulary, iVocabulary, block_size, user_input=None, max_len=30):
-    # Initialize context with user-provided input or default to [0] * block_size if None
-    if user_input:
-        # Tokenize user input to numerical IDs
-        context = [Vocabulary.get(word, 0) for word in user_input.split()]
-        # Pad or truncate context to match block_size
-        context = context[-block_size:] if len(context) >= block_size else [0] * (block_size - len(context)) + context
+# Streamlit app
+st.title("Text Generation App")
+st.write("Generate the next word predictions based on a pre-trained RNN model.")
+
+# Dropdowns to select the model configuration
+context_length = st.selectbox("Select context length", [3, 4])
+k_value = st.selectbox("Select k-value", [1, 3])
+random_seed = st.selectbox("Select random seed", [42, 123])
+
+# Select model path based on configuration
+model_path = f'rnn_text_generator_c{context_length}_k{k_value}_seed{random_seed}.pth'
+vocab_path = f'vocab_c{context_length}_k{k_value}_seed{random_seed}.json'
+
+# Model parameters
+embedding_dim = st.slider("Embedding Dimension", 32, 128, 64)
+hidden_dim = st.slider("Hidden Dimension", 64, 256, 128)
+
+# Load the model and vocabulary
+model, word_to_idx, idx_to_word = load_model_and_vocab(model_path, vocab_path)
+
+# Input text from the user
+user_text = st.text_input("Enter the starting text:")
+k_predictions = st.number_input("Number of words to predict", min_value=1, max_value=10, value=1)
+
+if st.button("Generate"):
+    if user_text:
+        input_indices = preprocess_text(user_text, word_to_idx)
+        
+        # Ensure the context length is satisfied by padding with "padding" tokens
+        if len(input_indices) < context_length:
+            input_indices = [word_to_idx["padding"]] * (context_length - len(input_indices)) + input_indices
+        else:
+            input_indices = input_indices[-context_length:]
+
+        # Convert input to tensor and generate predictions
+        input_tensor = torch.tensor([input_indices], dtype=torch.long)
+        output_text = user_text
+
+        for _ in range(k_predictions):
+            with torch.no_grad():
+                output = model(input_tensor)
+                _, next_word_idx = torch.max(output, dim=1)
+                next_word = idx_to_word[next_word_idx.item()]
+
+                # Append to output text
+                output_text += ' ' + next_word
+
+                # Update input tensor
+                input_indices = input_indices[1:] + [next_word_idx.item()]
+                input_tensor = torch.tensor([input_indices], dtype=torch.long)
+
+        # Display the generated text
+        st.write("Generated Text:")
+        st.write(output_text)
     else:
-        # Default context with all zeros
-        context = [0] * block_size
-
-    new_para = ' '.join([iVocabulary.get(idx, '') for idx in context]).strip()
-    for i in range(max_len):
-        x = torch.tensor(context).view(1, -1).to(device)
-        y_pred = model(x)
-        # Sample from the predicted logits
-        ix = torch.distributions.categorical.Categorical(logits=y_pred).sample().item()
-        word = iVocabulary[ix]
-        # charec = list(word)
-        # Append the word to the generated paragraph
-        new_para = new_para + " " + word
-        # Update context for next prediction
-        context = context[1:] + [ix]
-        # if '.' == word[-1]:
-        #     break
-
-    return new_para
-
-if st.button("Generate Prediction"):
-    predicted_text = generate_para(pred_model,Vocabulary,iVocabulary,context_length,input_text,max_len)
-    # predicted_text = str.title(predicted_text)
-    st.write("Predicted Text:", predicted_text)
-    # st.write("Predicted Text:",)
+        st.write("Please enter a starting text.")
